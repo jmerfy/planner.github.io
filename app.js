@@ -159,7 +159,7 @@ const LEGACY_KEY = 'ritm.planner.v1';
 const FAIL_KEY = 'ritm.auth.fails.v2';
 const UNTIL_KEY = 'ritm.auth.until.v2';
 const PBKDF2_ITER = 600000;
-const AUTOLOCK_MS = 15 * 60 * 1000;
+const SESSION_KEY = 'ritm.session.v2';
 
 let state = null;                 // расшифрованные данные живут только в памяти
 let vault = null;                 // только шифртекст и параметры KDF
@@ -168,8 +168,6 @@ let unlocked = false;
 let authBusy = false;
 let saveTimer = null;
 let saveChain = Promise.resolve();
-let lastActivity = Date.now();
-let hiddenAt = 0;
 let pendingRoutineMove = null;
 let dayNoteTimer = null;
 
@@ -224,9 +222,39 @@ async function deriveMaterial(password, salt, iterations) {
   const km = await window.crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = new Uint8Array(await window.crypto.subtle.deriveBits(
     { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: clamp(+iterations || PBKDF2_ITER, 100000, 2000000) }, km, 512));
-  const key = await window.crypto.subtle.importKey('raw', bits.slice(0, 32), { name: 'AES-GCM' }, false, ['encrypt','decrypt']);
+  const key = await window.crypto.subtle.importKey('raw', bits.slice(0, 32), { name: 'AES-GCM' }, true, ['encrypt','decrypt']);
   const verifier = new Uint8Array(await window.crypto.subtle.digest('SHA-256', bits.slice(32)));
-  return { key, verifier };
+  return { key, verifier, bits };
+}
+async function materialFromBits(bits) {
+  const key = await window.crypto.subtle.importKey('raw', bits.slice(0, 32), { name: 'AES-GCM' }, true, ['encrypt','decrypt']);
+  const verifier = new Uint8Array(await window.crypto.subtle.digest('SHA-256', bits.slice(32)));
+  return { key, verifier, bits };
+}
+function saveSessionMaterial(bits) {
+  try { sessionStorage.setItem(SESSION_KEY, bytesToB64(new Uint8Array(bits))); } catch (e) {}
+}
+function clearSessionMaterial() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+async function restoreSessionMaterial() {
+  let raw = null;
+  try { raw = sessionStorage.getItem(SESSION_KEY); } catch (e) { return false; }
+  if (!raw) return false;
+  try {
+    const bits = b64ToBytes(raw);
+    if (bits.length !== 64) throw new Error('bad-session');
+    const mat = await materialFromBits(bits);
+    const rec = readVault();
+    if (!rec || !ctEqual(mat.verifier, b64ToBytes(rec.verifier))) throw new Error('stale-session');
+    const data = await decryptVault(rec, mat.key);
+    vault = rec; cryptoKey = mat.key; state = normalizeState(data);
+    afterUnlock();
+    return true;
+  } catch (e) {
+    clearSessionMaterial();
+    return false;
+  }
 }
 async function makeVaultRecord(data, key, salt, iterations, verifier) {
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
@@ -248,7 +276,7 @@ async function decryptWithPassword(rec, password) {
   const mat = await deriveMaterial(password, salt, rec.iterations);
   if (!ctEqual(mat.verifier, b64ToBytes(rec.verifier))) throw new Error('bad-password');
   const data = await decryptVault(rec, mat.key);
-  return { data, key: mat.key };
+  return { data, key: mat.key, bits: mat.bits };
 }
 function readVault() {
   let raw = null;
@@ -304,6 +332,7 @@ async function createVault(password, data) {
   localStorage.setItem(VAULT_KEY, JSON.stringify(rec));
   try { localStorage.removeItem(LEGACY_KEY); } catch (e) {}
   vault = rec; cryptoKey = mat.key; state = normalized;
+  saveSessionMaterial(mat.bits);
 }
 async function changeVaultPassword(oldPass, newPass) {
   await flushSave();
@@ -315,6 +344,7 @@ async function changeVaultPassword(oldPass, newPass) {
   const newRec = await makeVaultRecord(normalized, mat.key, salt, PBKDF2_ITER, mat.verifier);
   localStorage.setItem(VAULT_KEY, JSON.stringify(newRec));
   vault = newRec; cryptoKey = mat.key; state = normalized;
+  saveSessionMaterial(mat.bits);
 }
 function save() {
   if (!unlocked || !cryptoKey || !state) return;
@@ -454,7 +484,6 @@ function afterUnlock(message = '') {
     setTimeout(() => toast('Добро пожаловать в «Ритм». Здесь есть пример данных — меняйте всё под себя.'), 500);
   }
   if (message) toast(message);
-  lastActivity = Date.now();
 }
 async function lock(reason = 'Планер заблокирован') {
   if (!unlocked) return;
@@ -468,7 +497,7 @@ async function lock(reason = 'Планер заблокирован') {
   document.body.classList.add('locked');
   $('#lockScreen').hidden = false;
   showUnlock(reason + '. Введите пароль, чтобы продолжить.');
-  lastActivity = Date.now();
+  clearSessionMaterial();
 }
 async function onSetup(e) {
   e.preventDefault();
@@ -497,8 +526,9 @@ async function onUnlock(e) {
   try {
     const rec = vault || readVault();
     if (!rec) throw new Error('no-vault');
-    const { data, key } = await decryptWithPassword(rec, pass);
+    const { data, key, bits } = await decryptWithPassword(rec, pass);
     state = normalizeState(data); cryptoKey = key; vault = rec;
+    saveSessionMaterial(bits);
     afterUnlock('С возвращением.');
   } catch (err) {
     if (err && err.message === 'bad-password') {
@@ -510,7 +540,7 @@ async function onUnlock(e) {
     }
   } finally { authBusy = false; setAuthBusy(''); }
 }
-function initAuth() {
+async function initAuth() {
   if (!supportsCrypto()) {
     showFatal('Для шифрования нужен Web Crypto API. Откройте сайт по HTTPS или через localhost в современном браузере.');
     return;
@@ -525,13 +555,14 @@ function initAuth() {
     showFatal('Зашифрованное хранилище повреждено. Восстановите данные из резервной копии или удалите хранилище и начните заново.');
     return;
   }
-  if (vault) showUnlock('Введите пароль, чтобы расшифровать планер.');
-  else showSetup(hasLegacy()
+  if (vault) {
+    setAuthBusy('Восстанавливаем сессию этой вкладки…');
+    const restored = await restoreSessionMaterial();
+    setAuthBusy('');
+    if (!restored) showUnlock('Введите пароль, чтобы расшифровать планер.');
+  } else showSetup(hasLegacy()
     ? 'Найдены прежние открытые записи. Задайте пароль — они будут зашифрованы, а старая копия удалена.'
     : 'Задайте пароль: все записи будут храниться только в зашифрованном виде.');
-}
-function autoLockCheck() {
-  if (unlocked && Date.now() - lastActivity > AUTOLOCK_MS) lock('Планер заблокирован после 15 минут бездействия');
 }
 
 function seedState() {
@@ -2369,7 +2400,7 @@ async function submitPasswordForm(f) {
   if (btn) btn.disabled = true;
   try {
     await changeVaultPassword(oldPass, newPass);
-    closeModal(); toast('Пароль изменён, данные перешифрованы'); lastActivity = Date.now();
+    closeModal(); toast('Пароль изменён, данные перешифрованы');
   } catch (e) {
     console.error(e);
     showErr(e && e.message === 'bad-password' ? 'Текущий пароль неверен.' : 'Не удалось перешифровать данные.');
@@ -2579,17 +2610,21 @@ function render() {
 
 /* ================= старт ================= */
 setInterval(positionNowLine, 30000);
-setInterval(() => { autoLockCheck().catch(err => console.error(err)); }, 30000);
 window.addEventListener('resize', () => { if (popEl) positionPopover(); if (unlocked && state && ui.view === 'today') { syncDayScale(); render(); } });
-['pointerdown','keydown','wheel','touchstart'].forEach(type =>
-  window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true }));
+/* Сессия живёт, пока открыта вкладка. Никакой автоблокировки по времени:
+   ключ лежит в sessionStorage и браузер удаляет его только при закрытии вкладки. */
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) hiddenAt = Date.now();
-  else if (hiddenAt && Date.now() - hiddenAt > AUTOLOCK_MS && unlocked) lock('Планер заблокирован после долгого отсутствия');
+  if (document.hidden && unlocked) flushSave().catch(err => console.error(err));
+});
+window.addEventListener('pagehide', () => {
+  if (unlocked) flushSave().catch(err => console.error(err));
+});
+window.addEventListener('beforeunload', () => {
+  if (unlocked) flushSave().catch(err => console.error(err));
 });
 
 $('#setupHelpBtn').addEventListener('click', openSetupHelpModal);
 $('#lockBtn').addEventListener('click', () => { if (unlocked) lock('Планер заблокирован'); });
 $('#changePassBtn').addEventListener('click', openPasswordModal);
 
-initAuth();
+initAuth().catch(err => { console.error(err); showFatal('Не удалось восстановить сессию. Введите пароль заново.'); });
