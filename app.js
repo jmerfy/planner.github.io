@@ -91,11 +91,42 @@ const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240];
 const DAY_START = 6 * 60, DAY_END = 23 * 60; // таймлайн 06:00–23:00
 const DAY_MIN = DAY_END - DAY_START, TL_PAD = 38, TL_MIN = 320, TL_MAX = 982;
 let PPM = 1, TL_H = DAY_MIN; // масштаб подбирается под высоту окна: весь день без прокрутки
+let TL_SIDE = 0;              // высота, при которой план дня дотягивается до низа боковой колонки
+const TL_SIDE_MAX = 1600;
 function syncDayScale() {
   const vh = (typeof window !== 'undefined' && window.innerHeight) || 900;
   const box = clamp(vh - 430, 360, 1020);
   TL_H = clamp(box - TL_PAD, TL_MIN, TL_MAX);
+  if (TL_SIDE) TL_H = Math.max(TL_H, TL_SIDE); // растягиваем до итогов дня, если колонка справа выше
   PPM = TL_H / DAY_MIN;
+}
+// После раскладки подгоняем высоту плана дня под боковую колонку, чтобы снизу не оставалось пустоты
+function fitTimelineToSide() {
+  if (ui.view !== 'today' || !unlocked || !state) return;
+  const card = $('.tl-card'), scroll = $('#tlScroll'), side = $('.today-side');
+  if (!card || !scroll || !side || !side.offsetHeight) return;
+  if (Math.abs(side.offsetTop - card.offsetTop) > 40) { // одна колонка (узкий экран) — не подгоняем
+    if (TL_SIDE) { TL_SIDE = 0; syncDayScale(); scroll.outerHTML = timelineHTML(ui.dayAnchor); positionNowLine(); }
+    return;
+  }
+  const chrome = card.offsetHeight - scroll.offsetHeight; // шапка карточки и рамки
+  const want = clamp(side.offsetHeight - chrome - TL_PAD, 0, TL_SIDE_MAX);
+  if (Math.abs(want - TL_SIDE) < 2) return;
+  TL_SIDE = want;
+  const prev = TL_H;
+  syncDayScale();
+  if (Math.abs(TL_H - prev) < 2) return;
+  scroll.outerHTML = timelineHTML(ui.dayAnchor);
+  positionNowLine();
+}
+let sideObserver = null;
+function observeSide() {
+  if (typeof ResizeObserver === 'undefined') return;
+  const side = $('.today-side');
+  if (!side) return;
+  if (sideObserver) sideObserver.disconnect();
+  sideObserver = new ResizeObserver(() => fitTimelineToSide());
+  sideObserver.observe(side);
 }
 
 const ICON = {
@@ -964,7 +995,7 @@ function daySummaryHTML(key) {
   return `<section class="card day-note-card" aria-label="Итоги дня">
     <div class="card-head">
       <h3>Итоги дня</h3>
-      <span class="hint">повествовательный рассказ без воды · сохраняется автоматически</span>
+      <span class="hint">сохраняется автоматически</span>
     </div>
     <div class="day-note-body">
       <textarea class="input day-note-textarea" data-day-note data-key="${key}" placeholder="Что сделано, что понравилось, что перенести на завтра…">${esc(n.text)}</textarea>
@@ -2536,7 +2567,12 @@ function render() {
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === ui.view));
   updateSideStats();
 
-  if (ui.view === 'today') positionNowLine();
+  if (ui.view === 'today') {
+    positionNowLine();
+    fitTimelineToSide();
+    observeSide();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fitTimelineToSide);
+  } else if (sideObserver) { sideObserver.disconnect(); sideObserver = null; }
   if (popEl && popAnchor && document.contains(popAnchor)) positionPopover();
   else if (popEl) closePopover();
 }

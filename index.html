@@ -73,7 +73,6 @@
           <svg viewBox="0 0 24 24" class="ic"><path d="M12 2.8 20 6v6c0 5-3.5 8.2-8 9.2-4.5-1-8-4.2-8-9.2V6Z"/><path d="M9 12.2l2 2 4-4"/></svg>
           <span>Сменить пароль</span>
         </button>
-        <span class="side-sec-note">AES‑GCM · PBKDF2 · автоблокировка 15 мин · без восстановления</span>
       </div>
 
       <input type="file" id="importFile" accept="application/json,.json" hidden>
@@ -148,9 +147,6 @@
 
     <div id="lockBusy" class="lock-busy" hidden></div>
 
-    <div class="lock-foot">
-      <b>Как устроена защита:</b> AES‑GCM, ключ выводится из пароля через PBKDF2‑SHA256 с 600 000 итераций, соль и проверочный хеш случайные. В localStorage лежит только шифртекст. Пароль не отправляется ни на какой сервер и не восстанавливается.
-    </div>
   </div>
 </div>
 
